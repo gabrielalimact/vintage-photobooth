@@ -4,16 +4,161 @@ import { useRef, useState, useEffect } from "react";
 import Image from "next/image";
 import { gsap } from "gsap";
 
+// Shader para filtros vintage
+const vertexShaderSource = `
+  attribute vec2 a_position;
+  attribute vec2 a_texCoord;
+  varying vec2 v_texCoord;
+  
+  void main() {
+    gl_Position = vec4(a_position, 0.0, 1.0);
+    v_texCoord = a_texCoord;
+  }
+`;
+
+const fragmentShaderSource = `
+  precision mediump float;
+  uniform sampler2D u_texture;
+  uniform float u_time;
+  varying vec2 v_texCoord;
+  
+  // Função de ruído pseudo-aleatório
+  float random(vec2 st) {
+    return fract(sin(dot(st.xy, vec2(12.9898, 78.233))) * 43758.5453123);
+  }
+  
+  void main() {
+    vec4 color = texture2D(u_texture, v_texCoord);
+    
+    // Converter para grayscale puro (preto e branco)
+    float gray = dot(color.rgb, vec3(0.299, 0.587, 0.114));
+    
+    // Aplicar contrast e brightness
+    gray = (gray - 0.5) * 1.25 + 0.5; // contrast 1.25
+    gray = gray * 1.1; // brightness 1.1
+    
+    // Manter apenas tons de cinza (sem sépia)
+    vec3 bw = vec3(gray);
+    
+    // Adicionar ruído vintage
+    float noise = (random(v_texCoord + u_time) - 0.5) * 0.12;
+    bw += noise;
+    
+    gl_FragColor = vec4(bw, color.a * 0.95);
+  }
+`;
+
 export default function Photobooth() {
   const videoRef = useRef<HTMLVideoElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
+  const glCanvasRef = useRef<HTMLCanvasElement>(null);
   const titleRef = useRef<HTMLHeadingElement>(null);
-  const photoPreviewsRef = useRef<HTMLDivElement>(null);
 
   const [openCamera, setOpenCamera] = useState(false);
   const [photos, setPhotos] = useState<string[]>([]);
   const [finalStrip, setFinalStrip] = useState<string | null>(null);
   const [showModal, setShowModal] = useState(false);
+
+  // Função para criar shader
+  function createShader(gl: WebGLRenderingContext, type: number, source: string) {
+    const shader = gl.createShader(type);
+    if (!shader) return null;
+    
+    gl.shaderSource(shader, source);
+    gl.compileShader(shader);
+    
+    if (!gl.getShaderParameter(shader, gl.COMPILE_STATUS)) {
+      console.error('Erro ao compilar shader:', gl.getShaderInfoLog(shader));
+      gl.deleteShader(shader);
+      return null;
+    }
+    
+    return shader;
+  }
+
+  // Função para criar programa WebGL
+  function createProgram(gl: WebGLRenderingContext) {
+    const vertexShader = createShader(gl, gl.VERTEX_SHADER, vertexShaderSource);
+    const fragmentShader = createShader(gl, gl.FRAGMENT_SHADER, fragmentShaderSource);
+    
+    if (!vertexShader || !fragmentShader) return null;
+    
+    const program = gl.createProgram();
+    if (!program) return null;
+    
+    gl.attachShader(program, vertexShader);
+    gl.attachShader(program, fragmentShader);
+    gl.linkProgram(program);
+    
+    if (!gl.getProgramParameter(program, gl.LINK_STATUS)) {
+      console.error('Erro ao linkar programa:', gl.getProgramInfoLog(program));
+      gl.deleteProgram(program);
+      return null;
+    }
+    
+    return program;
+  }
+
+  // Função para aplicar filtros WebGL
+  function applyWebGLFilters(sourceCanvas: HTMLCanvasElement): HTMLCanvasElement {
+    const glCanvas = glCanvasRef.current;
+    if (!glCanvas) return sourceCanvas;
+    
+    glCanvas.width = sourceCanvas.width;
+    glCanvas.height = sourceCanvas.height;
+    
+    const gl = glCanvas.getContext('webgl');
+    if (!gl) return sourceCanvas; // Fallback para canvas normal
+    
+    const program = createProgram(gl);
+    if (!program) return sourceCanvas;
+    
+    // Setup dos vértices
+    const positions = new Float32Array([
+      -1, -1,  0, 1,
+       1, -1,  1, 1,
+      -1,  1,  0, 0,
+       1,  1,  1, 0,
+    ]);
+    
+    const buffer = gl.createBuffer();
+    gl.bindBuffer(gl.ARRAY_BUFFER, buffer);
+    gl.bufferData(gl.ARRAY_BUFFER, positions, gl.STATIC_DRAW);
+    
+    // Setup dos atributos
+    const positionLocation = gl.getAttribLocation(program, 'a_position');
+    const texCoordLocation = gl.getAttribLocation(program, 'a_texCoord');
+    
+    gl.enableVertexAttribArray(positionLocation);
+    gl.vertexAttribPointer(positionLocation, 2, gl.FLOAT, false, 16, 0);
+    
+    gl.enableVertexAttribArray(texCoordLocation);
+    gl.vertexAttribPointer(texCoordLocation, 2, gl.FLOAT, false, 16, 8);
+    
+    // Criar textura da imagem
+    const texture = gl.createTexture();
+    gl.bindTexture(gl.TEXTURE_2D, texture);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, sourceCanvas);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+    
+    // Usar programa
+    gl.useProgram(program);
+    
+    // Setup uniforms
+    const textureLocation = gl.getUniformLocation(program, 'u_texture');
+    const timeLocation = gl.getUniformLocation(program, 'u_time');
+    
+    gl.uniform1i(textureLocation, 0);
+    gl.uniform1f(timeLocation, Math.random());
+    
+    // Render
+    gl.viewport(0, 0, glCanvas.width, glCanvas.height);
+    gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+    
+    return glCanvas;
+  }
 
   // Animação inicial do título
   useEffect(() => {
@@ -82,34 +227,43 @@ export default function Photobooth() {
     const ctx = canvas.getContext("2d");
     if (!ctx) return;
 
-    ctx.filter = `
-      grayscale(1)
-      contrast(1.25)
-      brightness(1.1)
-      saturate(0.75)
-      hue-rotate(10deg)
-      opacity(0.95)
-    `;
-
+    // Capturar imagem original (sem filtros)
     ctx.translate(canvas.width, 0);
     ctx.scale(-1, 1);
-
     ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
 
-    const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
-    const data = imageData.data;
+    // Aplicar filtros WebGL
+    const filteredCanvas = applyWebGLFilters(canvas);
     
-    for (let i = 0; i < data.length; i += 4) {
-      // adiciona ruído aleatório sutil (±15)
-      const noise = (Math.random() - 0.5) * 30;
-      data[i] = Math.max(0, Math.min(255, data[i] + noise));     // R
-      data[i + 1] = Math.max(0, Math.min(255, data[i + 1] + noise)); // G
-      data[i + 2] = Math.max(0, Math.min(255, data[i + 2] + noise)); // B
+    // Se WebGL falhar, aplicar filtros básicos via Canvas 2D
+    if (filteredCanvas === canvas) {
+      // Fallback para Safari e outros browsers sem WebGL
+      const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+      const data = imageData.data;
+      
+      for (let i = 0; i < data.length; i += 4) {
+        // Converter para grayscale puro
+        const gray = data[i] * 0.299 + data[i + 1] * 0.587 + data[i + 2] * 0.114;
+        
+        // Aplicar contrast e brightness
+        const enhanced = Math.min(255, Math.max(0, (gray - 128) * 1.25 + 128 * 1.1));
+        
+        // Aplicar tons de cinza puros (sem sépia)
+        data[i] = enhanced;     // R
+        data[i + 1] = enhanced; // G  
+        data[i + 2] = enhanced; // B
+        
+        // Adicionar ruído sutil
+        const noise = (Math.random() - 0.5) * 20;
+        data[i] = Math.max(0, Math.min(255, data[i] + noise));
+        data[i + 1] = Math.max(0, Math.min(255, data[i + 1] + noise));
+        data[i + 2] = Math.max(0, Math.min(255, data[i + 2] + noise));
+      }
+      
+      ctx.putImageData(imageData, 0, 0);
     }
-    
-    ctx.putImageData(imageData, 0, 0);
 
-    const photoData = canvas.toDataURL("image/png");
+    const photoData = (filteredCanvas === canvas ? canvas : filteredCanvas).toDataURL("image/png");
     setPhotos((prev) => {
       const newPhotos = [...prev, photoData];
       
@@ -315,6 +469,7 @@ export default function Photobooth() {
     </div>
 
     <canvas ref={canvasRef} className="hidden" />
+    <canvas ref={glCanvasRef} className="hidden" />
 
     {showModal && finalStrip && (
       <div className="fixed inset-0 z-50 flex items-center justify-center p-4">
